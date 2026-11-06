@@ -1,0 +1,30 @@
+name: Gitea HTTPS and SSH detail probe
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: windows-2022
+    timeout-minutes: 10
+    steps:
+      - name: HTTPS anonymous
+        shell: bash
+        run: |
+          echo "== HTTPS ls-remote anonymous =="
+          GIT_TERMINAL_PROMPT=0 git ls-remote https://git.mxk.dev/mxk/map-harness.git refs/heads/main 2>&1 | head -5 || echo "https anonymous failed"
+      - name: SSH 2222 detail
+        shell: bash
+        env:
+          GITEA_DEPLOY_KEY: ${{ secrets.GITEA_DEPLOY_KEY }}
+        run: |
+          set -u
+          work="$(mktemp -d)"
+          trap 'rm -rf "$work"' EXIT
+          umask 077
+          printf '%s\n' "$GITEA_DEPLOY_KEY" > "$work/key"
+          chmod 600 "$work/key"
+          echo "== ssh -vvv port 2222 =="
+          ssh -vvv -T -p 2222 -i "$work/key" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=no git@git.mxk.dev 2>&1 | rg 'Remote protocol|Server host key|Authentications|Offering|Server accepts|Permission|banner|kex|Connection|debug1: Local version' | head -30 || true
+          echo "== ssh -vvv port 22 =="
+          ssh -vvv -T -p 22 -i "$work/key" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=no git@git.mxk.dev 2>&1 | rg 'Remote protocol|Server host key|Authentications|Offering|Server accepts|Permission|banner|kex|Connection|debug1: Local version' | head -30 || true
