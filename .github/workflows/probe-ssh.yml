@@ -1,0 +1,35 @@
+name: Gitea SSH probe
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: windows-2022
+    timeout-minutes: 12
+    steps:
+      - name: TCP reachability
+        shell: pwsh
+        run: |
+          Test-NetConnection cq10.dpfrp.top -Port 22 -InformationLevel Detailed
+          Test-NetConnection git.mxk.dev -Port 22 -InformationLevel Detailed
+      - name: SSH deploy-key probe
+        shell: bash
+        env:
+          GITEA_DEPLOY_KEY: ${{ secrets.GITEA_DEPLOY_KEY }}
+          GITEA_SSH_URL: ${{ secrets.GITEA_SSH_URL }}
+        run: |
+          set -u
+          work="$(mktemp -d)"
+          trap 'rm -rf "$work"' EXIT
+          umask 077
+          printf '%s\n' "$GITEA_DEPLOY_KEY" > "$work/key"
+          chmod 600 "$work/key"
+          host="${GITEA_SSH_URL#*@}"; host="${host%%:*}"
+          echo "ssh_host=$host"
+          echo "== keyscan"
+          ssh-keyscan -T 15 -t ed25519 "$host" 2>&1 | tee "$work/kh" || true
+          if [ -s "$work/kh" ]; then ssh-keygen -lf "$work/kh" || true; fi
+          echo "== ls-remote"
+          GIT_SSH_COMMAND="ssh -i '$work/key' -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=20 -o StrictHostKeyChecking=no" \
+            git ls-remote "$GITEA_SSH_URL" refs/heads/main || echo "ls-remote failed"
