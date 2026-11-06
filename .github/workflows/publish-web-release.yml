@@ -1,0 +1,48 @@
+name: Publish Map Harness Web release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release tag
+        required: true
+        type: string
+      source_sha:
+        description: Gitea source commit
+        required: true
+        type: string
+      asset_base:
+        description: Asset base URL
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: map-harness-web-release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Publish
+        env:
+          ASSET_BASE: ${{ inputs.asset_base }}
+          VERSION: ${{ inputs.version }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          GITEA_REPO_URL: ${{ secrets.GITEA_REPO_URL }}
+          GITEA_TOKEN: ${{ secrets.GITEA_TOKEN }}
+          GITEA_WRITE_TOKEN: ${{ secrets.GITEA_WRITE_TOKEN }}
+          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+        run: |
+          set -euo pipefail
+          curl -fSL --retry 5 --retry-delay 3 --connect-timeout 15 --max-time 120 "$ASSET_BASE/publish-release.sh" -o /tmp/publish-release.sh
+          bash /tmp/publish-release.sh
+
