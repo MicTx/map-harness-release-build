@@ -1,0 +1,375 @@
+name: Map Harness Windows Web release
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Full Gitea commit SHA to build
+        required: true
+        type: string
+      expected_source_digest:
+        description: Expected community source digest
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: map-windows-web-release-${{ inputs.source_sha }}
+  cancel-in-progress: false
+
+env:
+  CI: 'true'
+  DSH_TELEMETRY_DISABLED: '1'
+  PRIMARY_NODE_VERSION: '24.21.0'
+
+jobs:
+  build:
+    name: Build Windows x64 package
+    runs-on: windows-2022
+    timeout-minutes: 180
+    outputs:
+      source_sha: ${{ steps.source.outputs.sha }}
+    steps:
+      - name: Require native Windows x64
+        run: |
+          if ($env:PROCESSOR_ARCHITECTURE -ne 'AMD64') {
+            throw "Expected AMD64, got $env:PROCESSOR_ARCHITECTURE."
+          }
+          $processor = Get-CimInstance Win32_Processor | Select-Object -First 1
+          if ($processor.Architecture -ne 9) {
+            throw "Expected Win32_Processor.Architecture 9 (x64), got $($processor.Architecture)."
+          }
+          if (Test-Path 'HKLM:\Software\Wine') {
+            throw 'Wine is not a supported qualification host.'
+          }
+          Write-Output "Runner image: $env:ImageOS $env:ImageVersion"
+          Get-ComputerInfo | Select-Object WindowsProductName, WindowsVersion, OsBuildNumber | Format-List
+
+      - name: Prepare runner storage
+        run: |
+          "NODE_COMPILE_CACHE=$env:RUNNER_TEMP\node-compile-cache" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "npm_config_devdir=$env:RUNNER_TEMP\node-gyp" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "TEMP=$env:RUNNER_TEMP" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "TMP=$env:RUNNER_TEMP" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Check out exact Gitea source
+        env:
+          GITEA_REPO_URL: ${{ secrets.GITEA_REPO_URL }}
+          GITEA_TOKEN: ${{ secrets.GITEA_TOKEN }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          if ($env:SOURCE_SHA -notmatch '^[0-9a-f]{40}$') {
+            throw 'source_sha must be a full 40-character lowercase commit SHA.'
+          }
+          if ([string]::IsNullOrWhiteSpace($env:GITEA_REPO_URL) -or [string]::IsNullOrWhiteSpace($env:GITEA_TOKEN)) {
+            throw 'GITEA_REPO_URL and GITEA_TOKEN must be configured.'
+          }
+          git init .
+          if ($LASTEXITCODE -ne 0) { throw 'git init failed.' }
+          git config core.symlinks true
+          git config core.autocrlf false
+          git config core.longpaths true
+          git config core.quotepath false
+          git remote add origin $env:GITEA_REPO_URL
+          if ($LASTEXITCODE -ne 0) { throw 'git remote add failed.' }
+          $basic = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes("mxk:$env:GITEA_TOKEN"))
+          $env:GIT_CONFIG_COUNT = '1'
+          $env:GIT_CONFIG_KEY_0 = 'http.extraHeader'
+          $env:GIT_CONFIG_VALUE_0 = "Authorization: Basic $basic"
+          git fetch --depth=1 --no-tags origin $env:SOURCE_SHA
+          if ($LASTEXITCODE -ne 0) { throw 'Gitea fetch of the requested commit failed.' }
+          git checkout --detach FETCH_HEAD
+          if ($LASTEXITCODE -ne 0) { throw 'Gitea checkout failed.' }
+          Remove-Item Env:GIT_CONFIG_COUNT, Env:GIT_CONFIG_KEY_0, Env:GIT_CONFIG_VALUE_0 -ErrorAction SilentlyContinue
+          $actual = (git rev-parse HEAD).Trim()
+          if ($actual -ne $env:SOURCE_SHA) {
+            throw "Checked out $actual, expected $($env:SOURCE_SHA)."
+          }
+
+      - name: Assert tracked symlinks were materialized
+        run: |
+          $links = @(git ls-files -s | Where-Object { $_ -match '^120000 ' })
+          foreach ($line in $links) {
+            $tab = $line.IndexOf("`t")
+            if ($tab -lt 0) { throw "Cannot parse tracked symlink entry: $line" }
+            $path = $line.Substring($tab + 1)
+            $item = Get-Item -LiteralPath $path -Force
+            if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) {
+              throw "Tracked symlink is not materialized: $path"
+            }
+          }
+          Write-Output "Materialized $($links.Count) tracked symlinks."
+
+      - name: Record source commit
+        id: source
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          $actual = (git rev-parse HEAD).Trim()
+          if ($actual -ne $env:SOURCE_SHA) {
+            throw "Source commit changed: $actual"
+          }
+          "sha=$actual" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - uses: pnpm/action-setup@v5.0.0
+        with:
+          dest: ${{ runner.temp }}/setup-pnpm-${{ github.run_id }}-${{ github.run_attempt }}-build
+
+      - uses: actions/setup-node@v7.0.0
+        with:
+          node-version: ${{ env.PRIMARY_NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install locked dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Seed pnpm deploy metadata
+        run: |
+          $seed = Join-Path $env:RUNNER_TEMP 'pnpm-deploy-seed'
+          New-Item -ItemType Directory -Path $seed -Force | Out-Null
+          $dependencies = @{}
+          foreach ($file in (git ls-files '**/package.json' 'package.json')) {
+            $manifest = Get-Content -LiteralPath $file -Raw | ConvertFrom-Json
+            foreach ($section in @('dependencies', 'optionalDependencies', 'peerDependencies')) {
+              $block = $manifest.$section
+              if ($null -eq $block) { continue }
+              foreach ($property in $block.PSObject.Properties) {
+                $value = [string]$property.Value
+                if ($value -match '^(workspace:|catalog:|file:|link:|portal:|npm:|git|https?:)') { continue }
+                $dependencies[$property.Name] = '*'
+              }
+            }
+          }
+          @{
+            private = $true
+            dependencies = $dependencies
+          } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $seed 'package.json') -Encoding utf8
+          pnpm --dir $seed install --lockfile-only --ignore-scripts
+
+      - name: Build community Web and enforce source digest
+        env:
+          EXPECTED_SOURCE_DIGEST: ${{ inputs.expected_source_digest }}
+        run: |
+          node map/bin/build-web.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'Community Web build failed.' }
+          $record = Get-Content .dsh-build/map-public-release.json -Raw | ConvertFrom-Json
+          $actual = [string]$record.sources.sha256
+          Write-Output "Community source digest: $actual"
+          if ($actual -ne $env:EXPECTED_SOURCE_DIGEST) {
+            throw "Community source digest mismatch: expected $($env:EXPECTED_SOURCE_DIGEST), got $actual."
+          }
+
+      - name: Build and pack Windows x64 Web service
+        env:
+          EXPECTED_SOURCE_DIGEST: ${{ inputs.expected_source_digest }}
+        run: |
+          node map/bin/build-application.mjs --mode web --defer-browser-check --skip-build --out .dsh-build/map-application/out
+          if ($LASTEXITCODE -ne 0) { throw 'Native application build failed.' }
+
+          $version = (Get-Content map/release/version.json -Raw | ConvertFrom-Json).version
+          $recordPath = ".dsh-build/map-application/out/map-harness-v$version-win-x64.json"
+          $appRecord = Get-Content -LiteralPath $recordPath -Raw | ConvertFrom-Json
+          if ($appRecord.sourceDigest -ne $env:EXPECTED_SOURCE_DIGEST) {
+            throw "Native application source digest mismatch: $($appRecord.sourceDigest)."
+          }
+
+          node map/bin/pack-web-service.mjs --application .dsh-build/map-application/out --out .dsh-build/map-web-service
+          if ($LASTEXITCODE -ne 0) { throw 'Web service pack failed.' }
+
+          $expected = "map-harness-v$version-web-win-x64.zip"
+          $archive = Get-ChildItem .dsh-build/map-web-service -Filter '*.zip' | Select-Object -First 1
+          if ($null -eq $archive -or $archive.Name -ne $expected) {
+            throw "Expected $expected, got $($archive.Name)."
+          }
+          $sha = (Get-FileHash $archive.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          Set-Content -LiteralPath .dsh-build/build-sha256.txt -Value "$sha  $expected" -Encoding ascii
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Retain failed build evidence
+        if: failure()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: map-windows-web-build-failure
+          path: |
+            .dsh-build/map-public-release.json
+            .dsh-build/map-application/out/**
+            .dsh-build/map-web-service/**
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Retain built package for clean verification
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: map-windows-web-unqualified
+          path: |
+            .dsh-build/map-web-service/*.zip
+            .dsh-build/map-web-service/web-service-manifest.json
+            .dsh-build/build-sha256.txt
+          include-hidden-files: true
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 14
+
+  verify:
+    name: Verify Windows x64 package
+    needs: build
+    runs-on: windows-2022
+    timeout-minutes: 180
+    steps:
+      - name: Require native Windows x64
+        run: |
+          if ($env:PROCESSOR_ARCHITECTURE -ne 'AMD64') {
+            throw "Expected AMD64, got $env:PROCESSOR_ARCHITECTURE."
+          }
+          $processor = Get-CimInstance Win32_Processor | Select-Object -First 1
+          if ($processor.Architecture -ne 9) {
+            throw "Expected Win32_Processor.Architecture 9 (x64), got $($processor.Architecture)."
+          }
+          if (Test-Path 'HKLM:\Software\Wine') {
+            throw 'Wine is not a supported qualification host.'
+          }
+
+      - name: Prepare runner storage
+        run: |
+          "NODE_COMPILE_CACHE=$env:RUNNER_TEMP\node-compile-cache" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "npm_config_devdir=$env:RUNNER_TEMP\node-gyp" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "TEMP=$env:RUNNER_TEMP" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "TMP=$env:RUNNER_TEMP" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Check out exact Gitea source
+        env:
+          GITEA_REPO_URL: ${{ secrets.GITEA_REPO_URL }}
+          GITEA_TOKEN: ${{ secrets.GITEA_TOKEN }}
+          SOURCE_SHA: ${{ needs.build.outputs.source_sha }}
+        run: |
+          if ($env:SOURCE_SHA -notmatch '^[0-9a-f]{40}$') {
+            throw 'The build job did not expose a full source commit SHA.'
+          }
+          if ([string]::IsNullOrWhiteSpace($env:GITEA_REPO_URL) -or [string]::IsNullOrWhiteSpace($env:GITEA_TOKEN)) {
+            throw 'GITEA_REPO_URL and GITEA_TOKEN must be configured.'
+          }
+          git init .
+          if ($LASTEXITCODE -ne 0) { throw 'git init failed.' }
+          git config core.symlinks true
+          git config core.autocrlf false
+          git config core.longpaths true
+          git config core.quotepath false
+          git remote add origin $env:GITEA_REPO_URL
+          if ($LASTEXITCODE -ne 0) { throw 'git remote add failed.' }
+          $basic = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes("mxk:$env:GITEA_TOKEN"))
+          $env:GIT_CONFIG_COUNT = '1'
+          $env:GIT_CONFIG_KEY_0 = 'http.extraHeader'
+          $env:GIT_CONFIG_VALUE_0 = "Authorization: Basic $basic"
+          git fetch --depth=1 --no-tags origin $env:SOURCE_SHA
+          if ($LASTEXITCODE -ne 0) { throw 'Gitea fetch of the requested commit failed.' }
+          git checkout --detach FETCH_HEAD
+          if ($LASTEXITCODE -ne 0) { throw 'Gitea checkout failed.' }
+          Remove-Item Env:GIT_CONFIG_COUNT, Env:GIT_CONFIG_KEY_0, Env:GIT_CONFIG_VALUE_0 -ErrorAction SilentlyContinue
+          $actual = (git rev-parse HEAD).Trim()
+          if ($actual -ne $env:SOURCE_SHA) {
+            throw "Checked out $actual, expected $($env:SOURCE_SHA)."
+          }
+
+      - name: Assert tracked symlinks were materialized
+        run: |
+          $links = @(git ls-files -s | Where-Object { $_ -match '^120000 ' })
+          foreach ($line in $links) {
+            $tab = $line.IndexOf("`t")
+            if ($tab -lt 0) { throw "Cannot parse tracked symlink entry: $line" }
+            $path = $line.Substring($tab + 1)
+            $item = Get-Item -LiteralPath $path -Force
+            if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) {
+              throw "Tracked symlink is not materialized: $path"
+            }
+          }
+          Write-Output "Materialized $($links.Count) tracked symlinks."
+
+      - uses: pnpm/action-setup@v5.0.0
+        with:
+          dest: ${{ runner.temp }}/setup-pnpm-${{ github.run_id }}-${{ github.run_attempt }}-verify
+
+      - uses: actions/setup-node@v7.0.0
+        with:
+          node-version: ${{ env.PRIMARY_NODE_VERSION }}
+          cache: pnpm
+          cache-dependency-path: pnpm-lock.yaml
+
+      - name: Install locked dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build community release evidence
+        env:
+          EXPECTED_SOURCE_DIGEST: ${{ inputs.expected_source_digest }}
+        run: |
+          node map/bin/build-web.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'Community Web build failed.' }
+          $record = Get-Content .dsh-build/map-public-release.json -Raw | ConvertFrom-Json
+          $actual = [string]$record.sources.sha256
+          Write-Output "Community source digest: $actual"
+          if ($actual -ne $env:EXPECTED_SOURCE_DIGEST) {
+            throw "Community source digest mismatch: expected $($env:EXPECTED_SOURCE_DIGEST), got $actual."
+          }
+
+      - name: Build workspace artifacts
+        run: pnpm run build:artifacts
+
+      - name: Install browser for native acceptance
+        run: pnpm --filter @deepseek-ai/dsh-web-frontend exec playwright install chromium
+
+      - uses: actions/download-artifact@v8.0.1
+        with:
+          name: map-windows-web-unqualified
+          path: .dsh-build/downloaded
+
+      - name: Verify and qualify downloaded package
+        env:
+          EXPECTED_SOURCE_DIGEST: ${{ inputs.expected_source_digest }}
+        run: |
+          $archive = Get-ChildItem .dsh-build/downloaded -Recurse -Filter '*.zip' | Select-Object -First 1
+          $manifest = Get-ChildItem .dsh-build/downloaded -Recurse -Filter 'web-service-manifest.json' | Select-Object -First 1
+          $hashFile = Get-ChildItem .dsh-build/downloaded -Recurse -Filter 'build-sha256.txt' | Select-Object -First 1
+          if ($null -eq $archive -or $null -eq $manifest -or $null -eq $hashFile) {
+            throw 'Downloaded package inputs are incomplete.'
+          }
+          $expected = (Get-Content $hashFile.FullName -Raw).Trim().Split(' ')[0]
+          $actual = (Get-FileHash $archive.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $expected) {
+            throw "Downloaded archive hash changed: expected $expected, got $actual."
+          }
+          $packageDir = '.dsh-build/map-web-service'
+          New-Item -ItemType Directory -Path $packageDir -Force | Out-Null
+          Copy-Item $archive.FullName (Join-Path $packageDir $archive.Name)
+          Copy-Item $manifest.FullName (Join-Path $packageDir $manifest.Name)
+          node map/bin/smoke-web-service.mjs --archive (Join-Path $packageDir $archive.Name) --manifest (Join-Path $packageDir $manifest.Name) --out $packageDir
+          if ($LASTEXITCODE -ne 0) { throw 'Native Windows package qualification failed.' }
+          $qualification = Get-Content (Join-Path $packageDir 'web-service-qualification.json') -Raw | ConvertFrom-Json
+          Write-Output "Qualified source digest: $($qualification.sourceDigest)"
+          if ($qualification.sourceDigest -ne $env:EXPECTED_SOURCE_DIGEST) {
+            throw "Qualified package source digest mismatch: $($qualification.sourceDigest)."
+          }
+          node map/bin/collect-web-service-release.mjs --input $packageDir --out .dsh-build/map-web-service-release
+          if ($LASTEXITCODE -ne 0) { throw 'Release collection failed.' }
+
+      - name: Retain qualified Windows release
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: map-windows-web-release
+          path: .dsh-build/map-web-service-release/*
+          include-hidden-files: true
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Retain qualification evidence
+        if: always()
+        uses: actions/upload-artifact@v7.0.1
+        with:
+          name: map-windows-web-evidence
+          path: .dsh-build/map-web-service/qualification-evidence/**
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 14
